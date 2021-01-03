@@ -3,6 +3,7 @@ from anytree import Node, Walker, WalkError
 from anytree.exporter import DotExporter
 from IPython.display import Image
 from fractions import Fraction
+from math import ceil
 
 class Recipe(object):
     def __init__(self,rdict):
@@ -39,6 +40,7 @@ class Machine(object):
         self.speed = rdict['craftingSpeed']
         self.max_ingredients = rdict['ingredientCount']
         self.categories = []
+        self.module_slots = rdict['moduleSlots']
         #self.energy_usage = rdict['energyUsage']
         for category, enabled in rdict['categories'].items():
             if enabled:
@@ -55,9 +57,17 @@ class Machine(object):
 class Cookbook(object):
     """A set of recipes and machines."""
 
-    def __init__(self, recipes, machines):
+    def __init__(self, recipes, machines, modules=None):
         self.recipes = recipes
         self.machines = machines
+        self.modules = modules
+
+        self.intermediates = None
+        for name, modu in modules.items():
+            if 'limitations' in modu.keys():
+                if len(modu['limitations'])>0:
+                    self.intermediates = modu['limitations']
+                    break
 
         all_items = set()
         for recip in recipes.values():
@@ -79,7 +89,7 @@ class Cookbook(object):
         self.composite_recipe_items = {}
         self.chosen_recipe_items = {}
 
-    def find_machines(self, recipe):
+    def find_machines(self, recipe,unavailable_machines):
         """List all the machines capable of crafting the given recipe.
            The recipe can be specified as a string or a recipe object."""
         if type(recipe)==str: recipe = self.recipes[recipe]
@@ -87,13 +97,16 @@ class Cookbook(object):
         category = recipe.category
         for machine_name, machine_values in self.machines.items():
             if category in machine_values.categories:
-                capable_machines.append(machine_name)
+                if machine_name not in unavailable_machines:
+                    capable_machines.append(machine_name)
         return capable_machines
 
     def search_recipes(self,partname):
         "List all recipe names containing the specified substring."
+        recis = []
         for rec in self.recipes:
-            if partname in rec: print(rec)
+            if partname in rec: recis.append(rec)
+        return recis
 
     def machine_ratio(self,production_recipe,machine1,consumption_recipe,machine2,item=None):
         """Give number of machine1's to exactly supply 1 machine2 with whatever the common item is."""
@@ -289,10 +302,12 @@ class Cookbook(object):
         return products
 
     def add_recipe_and_ingredients(self, item_node, use_composites=False, recipe=None, show_options=False,
-                                   preferred_recipes=()):
-        # A composite recipe is a way of squashing the tree, directly linking an output
-        # with the base inputs
+                                   preferred_recipes=(), prod_modules=None, unavailable_machines=()):
+
+        # use_composites: A composite recipe is a way of squashing the tree,
+        # directly linking an output with the base inputs.
         # At present this must be done manually; it would be nice to automate it.
+
         new_nodes = []
         item = item_node.name
         if item in self.composite_recipe_items and use_composites:
@@ -307,9 +322,14 @@ class Cookbook(object):
                 if option in preferred_recipes:
                     recipe = option
         if recipe:
+            machine_type = self.get_machine_type(recipe, unavailable_machines)
+            output_quantity = self.recipes[recipe].products[item]['amount']
+            if prod_modules and (recipe in self.intermediates):
+                nmods = machine_type.module_slots
+                output_quantity *= (1+nmods*self.modules[prod_modules]['effects']['productivity']['bonus'])
+
             new_nodes.append(Node(recipe+'-recipe',parent=item_node,flag='recipe',
-                                  number=self.recipes[recipe].products[item]['amount'],
-                                  shape='box'))
+                                  number=output_quantity, shape='box'))
             rec_node = new_nodes[-1]
             for ing in self.recipes[recipe].ingredients:
                 new_nodes.append(Node(ing,parent=rec_node,flag='item',
@@ -317,7 +337,7 @@ class Cookbook(object):
         else:
             if show_options:
                 options = self.find_producers(item)
-                if len(options)>10:
+                if len(options)>100:
                     new_nodes.append(Node('Too many recipes to show',parent=item_node,flag='option',number=1))
                 else:
                     for option in options:
@@ -326,41 +346,93 @@ class Cookbook(object):
                                               shape='box'))
         return new_nodes
 
-    def production_tree(self,output_item,quantity=1,maxdepth=10,commodities=(),use_composites=False, show_options=False,
-                        preferred_recipes=()):
+    def production_tree(self,output_item,quantity=1,maxdepth=10,commodities=(),
+                        use_composites=False, show_options=False,
+                        preferred_recipes=(), unavailable_machines=(),
+                        prod_modules=None, speed_modules=None, nbeacons=0):
         tree = [Node(output_item,flag='item',number=quantity,needed=quantity)]
         tree = tree + self.add_recipe_and_ingredients(tree[0],use_composites,show_options=show_options,
-                                                      preferred_recipes=preferred_recipes)
+                                                      preferred_recipes=preferred_recipes,
+                                                      unavailable_machines=unavailable_machines,
+                                                      prod_modules=prod_modules)
 
         for _ in range(maxdepth):
             new_nodes = []
             for node in tree:
                 if node.is_leaf and node.name not in commodities:
                     new_nodes += self.add_recipe_and_ingredients(node,use_composites,show_options=show_options,
-                                                                 preferred_recipes=preferred_recipes)
+                                                                 preferred_recipes=preferred_recipes,
+                                                                 unavailable_machines=unavailable_machines,
+                                                                 prod_modules=prod_modules)
             tree += new_nodes
 
         set_needs(tree)
-        self.set_machines(tree)
+        self.set_machines(tree, unavailable_machines,
+                          prod_modules=prod_modules,
+                          speed_modules=speed_modules, nbeacons=nbeacons)
         return tree
 
-    def set_machines(self,tree):
+    def get_machine_type(self, recname, unavailable_machines):
+        recipe = self.recipes[recname]  # Remove "-recipe"
+
+        # find all appropriate machines
+        potential_machines = self.find_machines(recipe,unavailable_machines)
+        if len(potential_machines) == 0:
+            print('No machines available for recipe '+recname)
+
+        # Choose the fastest
+        machine_type = self.machines[potential_machines[0]]
+        for machine in potential_machines[1:]:
+            m = self.machines[machine]
+            if m.speed > machine_type.speed:
+                machine_type = m
+        return machine_type
+
+
+
+    def set_machines(self,tree,unavailable_machines, prod_modules=None, speed_modules=None, nbeacons=0):
         """Determine number and type of machines used to produce 1 final output per second."""
         for node in tree:
             if node.flag == 'recipe':
                 recipe = self.recipes[node.name[:-7]]  # Remove "-recipe"
                 # Now find the appropriate (fastest) machine
-                potential_machines = self.find_machines(recipe)
+                potential_machines = self.find_machines(recipe,unavailable_machines)
+                if len(potential_machines) == 0:
+                    print('No machines available for recipe '+node.name)
                 machine_type = self.machines[potential_machines[0]]
                 for machine in potential_machines[1:]:
                     m = self.machines[machine]
                     if m.speed > machine_type.speed:
                         machine_type = m
                 # Compute number of machines needed
-                machines_needed = node.needed * recipe.time / machine_type.speed
+                speed = machine_type.speed
+                p_speed_factor = 0.
+                s_speed_factor = 0.
+                if prod_modules:
+                    npmods = machine_type.module_slots
+                    p_speed_factor = npmods*self.modules[prod_modules]['effects']['speed']['bonus']
+                if speed_modules:
+                    s_speed_factor = nbeacons*self.modules[speed_modules]['effects']['speed']['bonus']
+                speed = machine_type.speed * max(0.2, 1 + s_speed_factor + p_speed_factor)  # Min speed is 20%
+                machines_needed = node.needed * recipe.time / speed
                 node.machine_type = machine_type.name
                 node.machines = machines_needed
 
+
+def mixed_number_string(f):
+    f = f.limit_denominator(100)
+    whole = f.numerator//f.denominator 
+    if whole != 0:
+        whole = str(whole)
+    else:
+        whole = ''
+    part = f.numerator%f.denominator
+    if part != 0:
+        part = str(part)+'/'+str(f.denominator)
+    else:
+        part = ''
+    mixed = whole+' '+part
+    return mixed
 
 def show_tree(tree, number_out=1):
     def edgetypefunc(node, child):
@@ -385,10 +457,12 @@ def show_tree(tree, number_out=1):
     def nodenamefunc(node):
         if node.flag == 'item':
             f = Fraction(node.needed*number_out)
-            return '{1}\n{0}'.format(node.name, f.limit_denominator(100))
+            mixed = mixed_number_string(f)
+            return '{1}\n{0}'.format(node.name, mixed)
         elif node.flag == 'recipe':
             f = Fraction(node.machines*number_out)
-            return '{}\n{} {}'.format(node.name, f.limit_denominator(100), node.machine_type)
+            mixed = mixed_number_string(f)
+            return '{}\n{} {}'.format(node.name, mixed, node.machine_type)
         elif node.flag == 'option':
             return node.name
 
@@ -421,12 +495,23 @@ def all_ingredients(tree, number_out=1):
     """Gives all the base ingredients required by a production tree."""
     ingredients = {}
     for node in tree:
-        if node.is_leaf and node in tree[0].descendants:
+        if node.is_leaf and node in tree[0].descendants and node.flag=='item':
             if node.name in ingredients:
                 ingredients[node.name] += node.needed*number_out
             else:
                 ingredients[node.name] = node.needed*number_out
     return ingredients
+
+def all_machines(tree, number_out=1):
+    """Gives all the machines required by a production tree."""
+    machines = {}
+    for node in tree:
+        if node.flag == 'recipe':
+            if node.machine_type in machines.keys():
+                machines[node.machine_type] += int(ceil(node.machines))
+            else:
+                machines[node.machine_type] = int(ceil(node.machines))
+    return machines
 
 def sum_ingredients(dict_list):
     """Add up all ingredients for a group of production trees."""
