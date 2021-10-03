@@ -14,7 +14,10 @@ class Recipe(object):
         self.ingredients = {}
         for prod in rdict['products']:
             if 'amount' in prod.keys():
-                self.products[prod['name']] = {'amount': prod['amount']}
+                if 'probability' in prod.keys():
+                    self.products[prod['name']] = {'amount': prod['amount']*prod['probability']}
+                else:
+                    self.products[prod['name']] = {'amount': prod['amount']}
             else:
                 self.products[prod['name']] = {'amount': prod['probability']}
         for ing in rdict['ingredients']:
